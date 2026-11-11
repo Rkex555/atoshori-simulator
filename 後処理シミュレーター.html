@@ -1,0 +1,1533 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="UTF-8"><title>後処理マスター</title></head>
+<body style="margin:0;background:#222">
+<canvas id="game" width="800" height="500"></canvas>
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+// 工程の順番
+const steps = ["title", "extract", "tlc", "filter", "evap", "column", "result"];
+let stepIndex = 0;   // いま何番目の工程か
+let remain = 100;    // 手元に残っている生成物（％）
+const log = [];      // 工程ごとのロスの記録
+let t = 0;           // 経過時間（アニメーション用）
+
+// 抽出溶媒をランダムに決める（酢酸エチルは水より軽く、ジクロロメタンは水より重い）
+const solvents = ["酢酸エチル", "ジクロロメタン"];
+const solvent = solvents[Math.floor(Math.random() * solvents.length)];
+const organicIsUpper = (solvent === "酢酸エチル");
+
+// ===== 音（Web Audio APIでその場で合成する。音声ファイルは使わない） =====
+let audio = null;     // 最初のキー操作で作る（ブラウザの決まりで、操作する前は音を出せない）
+let muted = false;
+let noiseBuffer = null;
+let boilGain = null;
+
+function initAudio() {
+  if (audio) {
+    if (audio.state === "suspended") audio.resume();
+    return;
+  }
+  try {
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (e) {
+    audio = null;     // 音が使えない環境では無音で遊ぶ
+    return;
+  }
+  // ホワイトノイズ（「シャー」という音の元）を1秒分作っておく
+  noiseBuffer = audio.createBuffer(1, audio.sampleRate, audio.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  // エバポの蒸発音：ノイズをずっと鳴らしておき、音量だけを変える
+  const src = audio.createBufferSource();
+  src.buffer = noiseBuffer;
+  src.loop = true;
+  const filter = audio.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = 1200;
+  filter.Q.value = 0.8;
+  boilGain = audio.createGain();
+  boilGain.gain.value = 0;
+  src.connect(filter);
+  filter.connect(boilGain);
+  boilGain.connect(audio.destination);
+  src.start();
+}
+
+// ノイズを短く鳴らす。type が "highpass" なら「シュッ」、"lowpass" なら「ボコッ」に近い音
+function playNoise(duration, freq, volume, type) {
+  if (!audio || muted) return;
+  const src = audio.createBufferSource();
+  src.buffer = noiseBuffer;
+  const filter = audio.createBiquadFilter();
+  filter.type = type;
+  filter.frequency.value = freq;
+  const g = audio.createGain();
+  const now = audio.currentTime;
+  g.gain.setValueAtTime(volume, now);
+  g.gain.exponentialRampToValueAtTime(0.001, now + duration);   // だんだん小さくする
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(audio.destination);
+  src.start(now);
+  src.stop(now + duration);
+}
+
+// 音程のある音を鳴らす（ピッ、ポン など）
+function playTone(freq, duration, volume, wave) {
+  if (!audio || muted) return;
+  const osc = audio.createOscillator();
+  osc.type = wave || "sine";
+  osc.frequency.value = freq;
+  const g = audio.createGain();
+  const now = audio.currentTime;
+  g.gain.setValueAtTime(volume, now);
+  g.gain.exponentialRampToValueAtTime(0.001, now + duration);
+  osc.connect(g);
+  g.connect(audio.destination);
+  osc.start(now);
+  osc.stop(now + duration);
+}
+
+// 音を順番に鳴らす（ファンファーレなど）
+function playMelody(freqs, interval) {
+  for (let i = 0; i < freqs.length; i++) {
+    setTimeout(() => playTone(freqs[i], 0.25, 0.2, "triangle"), i * interval);
+  }
+}
+
+// 蒸発音の大きさを変える（0で無音）
+function setBoilVolume(v) {
+  if (!audio || !boilGain) return;
+  boilGain.gain.setTargetAtTime(muted ? 0 : v, audio.currentTime, 0.1);
+}
+
+const keys = {};
+document.addEventListener("keydown", e => {
+  initAudio();
+  if (e.key === "m" || e.key === "M") muted = !muted;   // Mで音のオン・オフ
+  keys[e.key] = true;
+  if (e.key === "Enter") onEnter();
+  if ((e.key === "r" || e.key === "R") && steps[stepIndex] === "result") restart();
+  if (!transition && steps[stepIndex] === "filter") rinseFilter(e.key);
+});
+document.addEventListener("keyup", e => { keys[e.key] = false; });
+
+// Enterキーを押したときの動き（工程ごとに変える）
+function onEnter() {
+  if (transition) return;               // 運んでいる間は操作できない
+  const step = steps[stepIndex];
+  if (step === "extract") finishExtract();
+  else if (step === "tlc") finishTLC();
+  else if (step === "filter") finishFilter();
+  else if (step === "evap") finishEvap();
+  else if (step === "column") onEnterColumn();
+  else if (step === "title") nextStep(0);   // まだ作っていない工程は、ロス0％で次へ
+}
+
+function nextStep(lossPercent) {
+  if (stepIndex > 0 && stepIndex < steps.length - 1) {
+    remain = remain * (1 - lossPercent / 100);
+    log.push({ step: steps[stepIndex], loss: lossPercent });
+  }
+  const prev = steps[stepIndex];
+  stepIndex = Math.min(stepIndex + 1, steps.length - 1);
+  startTransition(prev, steps[stepIndex]);
+  if (steps[stepIndex] === "result") {
+    saveRecord();
+    playMelody([523, 659, 784, 1047], 140);    // ファンファーレ
+  }
+}
+
+// ===== 過去の記録（ブラウザに保存する） =====
+let records = [];
+function loadRecords() {
+  try {
+    records = JSON.parse(localStorage.getItem("atoshori_records") || "[]");
+  } catch (e) {
+    records = [];   // 保存できない環境では記録なしで遊ぶ
+  }
+}
+function saveRecord() {
+  const d = new Date();
+  const date = (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours() + ":" + String(d.getMinutes()).padStart(2, "0");
+  records.unshift({ date: date, loss: 100 - remain, solvent: solvent });
+  records = records.slice(0, 10);   // 新しい順に10件まで
+  try {
+    localStorage.setItem("atoshori_records", JSON.stringify(records));
+  } catch (e) {}
+}
+loadRecords();
+
+// もう一度遊ぶ（ページを読み込み直すと、溶媒も選び直される）
+function restart() {
+  location.reload();
+}
+const restartButton = { x: 315, y: 364, w: 170, h: 40 };
+canvas.addEventListener("click", e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const b = restartButton;
+  if (steps[stepIndex] === "result" && mx > b.x && mx < b.x + b.w && my > b.y && my < b.y + b.h) {
+    restart();
+  }
+});
+
+// ===== 実験室の背景 =====
+function drawLab() {
+  // 壁
+  ctx.fillStyle = "#dfe6e9";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // 窓
+  ctx.fillStyle = "#a8d8f0";
+  ctx.fillRect(560, 40, 180, 120);
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 6;
+  ctx.strokeRect(560, 40, 180, 120);
+  ctx.beginPath();
+  ctx.moveTo(650, 40);
+  ctx.lineTo(650, 160);
+  ctx.stroke();
+  // 棚と試薬びん
+  ctx.fillStyle = "#8d6e63";
+  ctx.fillRect(40, 120, 300, 10);
+  const bottleColors = ["#8e44ad", "#e67e22", "#16a085", "#c0392b"];
+  for (let i = 0; i < bottleColors.length; i++) {
+    ctx.fillStyle = bottleColors[i];
+    ctx.fillRect(60 + i * 70, 70, 36, 50);
+    ctx.fillStyle = "#333";
+    ctx.fillRect(68 + i * 70, 60, 20, 12);
+  }
+  // 実験台
+  ctx.fillStyle = "#37474f";
+  ctx.fillRect(0, 400, canvas.width, 100);
+  ctx.fillStyle = "#263238";
+  ctx.fillRect(0, 400, canvas.width, 12);
+}
+
+// ===== 色を混ぜる =====
+// c1とc2を r（0〜1）の割合で混ぜた色を返す。r=0ならc1、r=1ならc2
+function mixColor(c1, c2, r) {
+  const a = [parseInt(c1.slice(1, 3), 16), parseInt(c1.slice(3, 5), 16), parseInt(c1.slice(5, 7), 16)];
+  const b = [parseInt(c2.slice(1, 3), 16), parseInt(c2.slice(3, 5), 16), parseInt(c2.slice(5, 7), 16)];
+  const m = a.map((v, i) => Math.round(v + (b[i] - v) * r));
+  return "rgb(" + m[0] + "," + m[1] + "," + m[2] + ")";
+}
+
+// ===== 器具を描く部品 =====
+// 三角フラスコ。angle：傾き　fill：液の量（0〜1）　crystals：底に乾燥剤があるか　scale：大きさ
+function drawErlenmeyer(x, y, angle, fill, color, crystals, scale) {
+  const s = scale || 1;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.scale(s, s);
+  function shape() {                    // 首 → 肩 → 丸みのある底
+    ctx.beginPath();
+    ctx.moveTo(-11, -78);
+    ctx.lineTo(-11, -38);
+    ctx.lineTo(-46, 30);
+    ctx.quadraticCurveTo(-50, 42, -38, 42);
+    ctx.lineTo(38, 42);
+    ctx.quadraticCurveTo(50, 42, 46, 30);
+    ctx.lineTo(11, -38);
+    ctx.lineTo(11, -78);
+    ctx.closePath();
+  }
+  shape();
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";      // ガラス
+  ctx.fillRect(-60, -85, 120, 130);
+  if (crystals) {                               // 底にたまった乾燥剤（硫酸ナトリウム）
+    ctx.fillStyle = "#ffffff";
+    for (let i = 0; i < 26; i++) {
+      ctx.fillRect(-40 + (i * 29) % 80, 37 - (i * 7) % 6, 4, 3);
+    }
+  }
+  if (fill > 0) {
+    ctx.rotate(-angle);                         // 傾けても液面は水平
+    const top = 42 - 115 * fill;
+    const g = ctx.createLinearGradient(0, top, 0, top + 80);
+    g.addColorStop(0, color);
+    g.addColorStop(1, "rgba(160,90,10,0.95)");
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = g;
+    ctx.fillRect(-120, top, 240, 200);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "rgba(255,255,255,0.6)";    // 液面の光
+    ctx.fillRect(-120, top, 240, 2);
+  }
+  ctx.restore();
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2.5;
+  shape();
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.7)";      // 口の縁
+  ctx.fillRect(-14, -83, 28, 6);
+  ctx.strokeRect(-14, -83, 28, 6);
+  ctx.strokeStyle = "rgba(108,122,137,0.8)";    // 目盛り
+  ctx.lineWidth = 1;
+  for (let k = 0; k < 3; k++) {
+    ctx.beginPath();
+    ctx.moveTo(18, 2 + k * 10);
+    ctx.lineTo(25, 2 + k * 10);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";    // ガラスのつや
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(-32, 22);
+  ctx.lineTo(-15, -20);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ナスフラスコ（運ぶとき用）。r：半径　fill：液の量（0〜1）
+function drawRBF(x, y, r, fill, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillRect(-8, -r - 28, 16, 30);
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2.5;
+  ctx.strokeRect(-8, -r - 28, 16, 30);
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(-r, -r, 2 * r, 2 * r);
+  ctx.fillStyle = color;
+  ctx.fillRect(-r, r - 2 * r * fill, 2 * r, 2 * r * fill);
+  ctx.restore();
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(0, 0, r - 8, Math.PI * 1.1, Math.PI * 1.4);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ビーカー。bottom：底のy座標　layers：下からたまっている液 [{amount（0〜1）, color}]
+function drawBeaker(x, bottom, label, layers) {
+  const w = 44, h = 38;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x - w / 2, bottom - h, w, h);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.fillRect(x - w / 2, bottom - h, w, h);
+  let y = bottom;
+  for (let i = 0; i < layers.length; i++) {
+    const hh = Math.min(1, layers[i].amount) * (h - 6);
+    ctx.fillStyle = layers[i].color;
+    ctx.fillRect(x - w / 2, y - hh, w, hh);
+    y -= hh;
+  }
+  ctx.restore();
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - w / 2 - 3, bottom - h);        // 注ぎ口
+  ctx.lineTo(x - w / 2, bottom - h + 3);
+  ctx.lineTo(x - w / 2, bottom);
+  ctx.lineTo(x + w / 2, bottom);
+  ctx.lineTo(x + w / 2, bottom - h);
+  ctx.stroke();
+  ctx.fillStyle = "#2d3436";
+  ctx.font = "11px sans-serif";
+  ctx.fillText(label, x - w / 2 + 4, bottom - 14);
+}
+
+// 手袋をした手と白衣の袖（器具の首をつかむ）
+function drawGlove(x, y) {
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "#f5f6fa";                  // 白衣の袖
+  ctx.lineWidth = 26;
+  ctx.beginPath();
+  ctx.moveTo(x + 90, -40);
+  ctx.lineTo(x + 30, y - 18);
+  ctx.stroke();
+  ctx.strokeStyle = "#dcdde1";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.fillStyle = "#5dade2";                    // ニトリル手袋
+  ctx.beginPath();
+  ctx.ellipse(x + 18, y - 6, 17, 13, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#5dade2";                  // 首に回した指
+  ctx.lineWidth = 6;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x + 8, y - 8 + i * 7);
+    ctx.lineTo(x - 13, y - 6 + i * 7);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ===== 工程のあいだの「器具を運ぶ」演出 =====
+let transition = null;   // 運んでいる間だけ中身が入る
+const transitionLength = 110;
+const carryPlans = {
+  "tlc>filter":    { vessel: "erlen",   from: [400, 377], to: [330, 250], text: "回収した有機層に乾燥剤を加え、ろ過台へ" },
+  "filter>evap":   { vessel: "rbf",     from: [470, 370], to: [320, 300], text: "ろ液の入ったナスフラスコをエバポへ" },
+  "evap>column":   { vessel: "rbfOil",  from: [320, 300], to: [400, 40],  text: "濃縮した粗生成物をカラムにチャージ" }
+};
+
+function startTransition(from, to) {
+  const plan = carryPlans[from + ">" + to];
+  if (plan) transition = { from: from, to: to, frame: 0, plan: plan };
+}
+
+// その工程の器具が、いま運ばれている最中か（運ばれる器具は場面の中に描かない）
+function isCarrying(scene, role) {
+  if (!transition) return false;
+  return (role === "in" && transition.to === scene) || (role === "out" && transition.from === scene);
+}
+
+function ease(p) { return p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; }
+
+function drawCarry(plan, p) {
+  const e = ease(p);
+  const x = plan.from[0] + (plan.to[0] - plan.from[0]) * e;
+  const y = plan.from[1] + (plan.to[1] - plan.from[1]) * e - Math.sin(Math.PI * p) * 90;
+  let gripY = y - 70;
+  if (plan.vessel === "erlen") {
+    const sc = 0.55 + 0.45 * e;          // 運びながら近づいて大きく見える
+    drawErlenmeyer(x, y, 0, 0.7, "#f0a830", true, sc);
+    gripY = y - 70 * sc;
+  } else if (plan.vessel === "rbf") {
+    drawRBF(x, y, 40, 0.55, "#f0a830");
+    gripY = y - 58;
+  } else if (plan.vessel === "rbfOil") {
+    drawRBF(x, y, 40, 0.12, "#d35400");        // 濃縮して少量の油状物が残る
+    gripY = y - 58;
+  } else {
+    drawBeaker(x, y + 19, "目的物", [{ amount: Math.max(0.15, prodGot), color: "rgba(230,126,34,0.85)" }]);
+    gripY = y - 10;
+  }
+  drawGlove(x, gripY);
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.fillRect(150, 420, 500, 30);
+  ctx.fillStyle = "#2d3436";
+  ctx.font = "18px sans-serif";
+  ctx.fillText(plan.text, 165, 441);
+}
+
+// ===== 分液ロート =====
+// ロートの形（道筋）を作る
+function funnelShape() {
+  ctx.beginPath();
+  ctx.moveTo(-8, -95);
+  ctx.quadraticCurveTo(-60, -60, -45, 20);
+  ctx.lineTo(-6, 80);
+  ctx.lineTo(6, 80);
+  ctx.lineTo(45, 20);
+  ctx.quadraticCurveTo(60, -60, 8, -95);
+  ctx.closePath();
+}
+
+// x, y：位置　angle：傾き　shaking：振っている最中か　lift：栓の浮き具合
+// lowerAmt, upperAmt：下層・上層の残り（0〜1。省略すると満タン）　cockOpen：コックを開いているか
+function drawFunnel(x, y, angle, shaking, lift, lowerAmt, upperAmt, cockOpen) {
+  if (lowerAmt === undefined) lowerAmt = 1;
+  if (upperAmt === undefined) upperAmt = 1;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+
+  // 中の液体：ロートの形の内側だけに描く
+  ctx.save();
+  funnelShape();
+  ctx.clip();
+  // 抽出が進むほど、目的物の色が水層から有機層へ移る
+  const r = progress / 100;
+  const organicColor = mixColor("#f4f6f7", "#f0a830", r);   // 無色 → 橙
+  const waterColor   = mixColor("#f0a830", "#bfe3f5", r);   // 橙 → 薄い水色
+  if (shaking) {
+    const wave = Math.sin(t * 0.5) * 10;
+    ctx.fillStyle = mixColor("#f0a830", "#e8d9b5", 0.5);     // 混ざって濁った液
+    ctx.fillRect(-70, -20 + wave, 140, 120);
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    for (let i = 0; i < 6; i++) {         // 泡
+      ctx.beginPath();
+      ctx.arc(Math.random() * 60 - 30, Math.random() * 80 - 10, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    const wave = Math.sin(t * 0.05) * 2;
+    // 下から抜けていくので、境界面と液面は下がっていく
+    const boundary = 80 - 50 * lowerAmt;                 // 上層と下層の境界面
+    const surface = boundary - 50 * upperAmt;            // 液面
+    ctx.fillStyle = organicIsUpper ? organicColor : waterColor;   // 上層
+    ctx.fillRect(-70, surface + wave, 140, boundary - surface);
+    ctx.fillStyle = organicIsUpper ? waterColor : organicColor;   // 下層
+    ctx.fillRect(-70, boundary + wave, 140, 100);
+    if (lowerAmt <= 0 && upperAmt > 0) {                 // 下層が抜けきったら上層が底まで来る
+      ctx.fillStyle = organicIsUpper ? organicColor : waterColor;
+      ctx.fillRect(-70, boundary + wave, 140, 100);
+    }
+    if (lowerAmt <= 0 && upperAmt <= 0) {                // 空になった
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.fillRect(-70, -100, 140, 200);
+    }
+  }
+  ctx.restore();
+
+  // ガラスの輪郭
+  funnelShape();
+  ctx.strokeStyle = "#555";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  // 首、コック、足
+  ctx.strokeRect(-8, -120, 16, 25);
+  // 栓：圧力がたまると少しずつ浮き、限界が近いとカタカタ震える
+  const jitter = lift > 6 ? (Math.random() - 0.5) * 3 : 0;
+  ctx.fillStyle = "#636e72";
+  ctx.fillRect(-11 + jitter, -132 - lift, 22, 14);
+  // コック：開くと取っ手が縦向きになる
+  ctx.fillStyle = "#e17055";
+  if (cockOpen) ctx.fillRect(-4, 74, 8, 22);
+  else ctx.fillRect(-16, 80, 32, 10);
+  ctx.strokeRect(-3, 90, 6, 50);
+
+  ctx.restore();
+}
+
+// ===== 抽出の状態とルール =====
+let progress = 0;    // 抽出の進み具合（0〜100）
+let pressure = 0;    // ロートの中の圧力（0〜100）
+let spillLoss = 0;   // 吹きこぼれで失った量（％）
+let ventTimer = 0;   // 「プシュッ」を表示する残り時間
+let spillTimer = 0;  // 「吹きこぼれ！」を表示する残り時間
+
+function updateExtract() {
+  const shaking = keys[" "] === true;
+  if (shaking) {
+    progress = Math.min(100, progress + 0.3);   // 振るほど抽出が進む
+    pressure = pressure + 0.6;                  // 振るほど圧力が上がる
+    if (t % 16 === 0) playNoise(0.18, 700, 0.3, "lowpass");   // チャプチャプ
+  }
+  // 振っていないときにVキーでガス抜き
+  if ((keys["v"] || keys["V"]) && !shaking && pressure > 0) {
+    pressure = 0;
+    ventTimer = 30;
+    playNoise(0.4, 3000, 0.4, "highpass");      // プシュッ
+  }
+  // ガス抜きを忘れて圧力が限界になると吹きこぼれる
+  if (pressure >= 100) {
+    spillLoss = spillLoss + 20;
+    pressure = 0;
+    spillTimer = 60;
+    playNoise(0.7, 500, 0.7, "lowpass");        // バシャッ
+  }
+  if (pressure > 75 && t % 8 === 0) playTone(220 + Math.random() * 60, 0.04, 0.06, "square");   // 栓がカタカタ
+  if (ventTimer > 0) ventTimer--;
+  if (spillTimer > 0) spillTimer--;
+}
+
+// 抽出を終えて、ロスを計算する
+function finishExtract() {
+  const loss = Math.min(100, (100 - progress) * 0.5 + spillLoss);
+  nextStep(loss);
+}
+
+// メーター（棒グラフ）を描く
+function drawMeter(x, y, label, value, color) {
+  ctx.fillStyle = "#000";
+  ctx.font = "16px sans-serif";
+  ctx.fillText(label, x, y - 6);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(x, y, 200, 18);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, 2 * Math.min(100, value), 18);
+  ctx.strokeStyle = "#000";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, 200, 18);
+}
+
+// ===== 分液（TLCで確かめてから、コックを開けて層を分ける） =====
+let lowerLeft = 1, upperLeft = 1;      // ロートに残っている下層・上層（0〜1）
+let collectOrg = 0, collectAq = 0;     // 回収フラスコに入った有機層・水層
+let wasteOrg = 0, wasteAq = 0;         // 廃液ビーカーに入った有機層・水層
+let underCollect = true;               // 出口の下にあるのが回収フラスコか
+let sepCollectX = 400, sepWasteX = 480;
+let sepLoss = 0;
+
+function updateSeparation() {
+  if (keys["ArrowLeft"])  underCollect = true;     // ←：回収フラスコを出口の下へ
+  if (keys["ArrowRight"]) underCollect = false;    // →：廃液ビーカーを出口の下へ
+  sepCollectX += ((underCollect ? 400 : 320) - sepCollectX) * 0.25;
+  sepWasteX += ((underCollect ? 480 : 400) - sepWasteX) * 0.25;
+  const open = keys[" "] === true;
+  if (!open) return;
+  const rate = 0.006;                  // 1回の描き直しで抜ける量
+  let organic = 0, aqueous = 0;
+  if (lowerLeft > 0) {                 // まず下層が抜ける
+    const a = Math.min(rate, lowerLeft);
+    lowerLeft -= a;
+    if (organicIsUpper) aqueous = a; else organic = a;
+  } else if (upperLeft > 0) {          // 下層が抜けきったら上層
+    const a = Math.min(rate, upperLeft);
+    upperLeft -= a;
+    if (organicIsUpper) organic = a; else aqueous = a;
+  } else {
+    return;
+  }
+  if (underCollect) { collectOrg += organic; collectAq += aqueous; }
+  else { wasteOrg += organic; wasteAq += aqueous; }
+  if (t % 10 === 0) playNoise(0.12, 1500, 0.12, "bandpass");   // チョロチョロ
+}
+
+function finishTLC() {
+  if (lowerLeft > 0 || upperLeft > 0) return;    // ロートが空になるまで次へ進めない
+  // 有機層を捨てた分はそのままロス。水が混ざると乾燥しきれずロスが出る
+  sepLoss = Math.min(100, wasteOrg * 100 + collectAq * 20);
+  if (wasteOrg < 0.1) playMelody([880, 1320], 120);
+  else playTone(140, 0.5, 0.2, "sawtooth");
+  nextStep(sepLoss);
+}
+
+// TLCの板を描く。uv：UVランプを当てているか
+function drawTLC(x, y, uv) {
+  const w = 200, h = 260;
+  const base = y + h - 30;              // 原点の線
+  const front = y + 20;                 // 溶媒の先端
+  ctx.fillStyle = uv ? "#7bed9f" : "#ffffff";   // UV254では板が緑に光る
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "#555";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
+  ctx.beginPath();                      // 原点と先端の鉛筆線
+  ctx.moveTo(x + 10, base);  ctx.lineTo(x + w - 10, base);
+  ctx.moveTo(x + 10, front); ctx.lineTo(x + w - 10, front);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Rf値からスポットのy座標を計算する
+  function spot(laneX, rf) {
+    if (!uv) return;                    // UVを当てないと見えない
+    ctx.fillStyle = "#4b2a57";
+    ctx.beginPath();
+    ctx.ellipse(laneX, base - rf * (base - front), 9, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const lane1 = x + 45, lane2 = x + 100, lane3 = x + 155;
+  spot(lane1, 0.6);                     // 原料
+  const organicLane = organicIsUpper ? lane2 : lane3;
+  const waterLane   = organicIsUpper ? lane3 : lane2;
+  spot(organicLane, 0.35);              // 目的物
+  spot(organicLane, 0.6);               // 少し残った原料
+  spot(waterLane, 0.0);                 // 塩など（原点から動かない）
+
+  ctx.fillStyle = "#000";
+  ctx.font = "14px sans-serif";
+  ctx.fillText("原料", lane1 - 14, y + h - 8);
+  ctx.fillText("上層", lane2 - 14, y + h - 8);
+  ctx.fillText("下層", lane3 - 14, y + h - 8);
+}
+
+// ===== エバポの状態とルール =====
+// 浴温40℃で溶媒が沸騰し始める圧力（hPa）。値はゲーム用の目安
+const boilPressure = { "酢酸エチル": 240, "ジクロロメタン": 870 };
+const boilP = boilPressure[solvent] || 300;
+let vacuum = 0;        // 減圧の強さ（0〜100）
+let evapProgress = 0;  // 濃縮の進み具合（0〜100）
+let bumpRisk = 0;      // 突沸の危険度（0〜100）
+let evapLoss = 0;      // 突沸で失った量（％）
+let bumpTimer = 0;     // 「突沸！」を表示する残り時間
+
+function currentPressure() {
+  return 1013 - vacuum * 9.9;          // 減圧を強めるほど圧力が下がる
+}
+
+function updateEvap() {
+  if (keys["ArrowUp"])   vacuum = Math.min(100, vacuum + 0.15);
+  if (keys["ArrowDown"]) vacuum = Math.max(0, vacuum - 0.15);
+  const diff = boilP - currentPressure();   // 沸点の圧力をどれだけ下回っているか
+  if (diff > 0 && evapProgress < 100) {
+    evapProgress = Math.min(100, evapProgress + Math.min(diff, 60) * 0.002);
+    setBoilVolume(Math.min(diff, 60) / 60 * 0.15);   // 激しく沸くほど大きな蒸発音
+    if (Math.random() < 0.06) playTone(300 + Math.random() * 500, 0.05, 0.05);   // 泡がはじける音
+  } else {
+    setBoilVolume(0);
+  }
+  if (diff > 60 && evapProgress < 100) {
+    bumpRisk = bumpRisk + (diff - 60) * 0.05;  // 下げすぎると突沸しやすくなる
+  } else {
+    bumpRisk = Math.max(0, bumpRisk - 1);
+  }
+  if (bumpRisk >= 100) {               // 突沸！
+    evapLoss = evapLoss + 15;
+    bumpRisk = 0;
+    playNoise(0.9, 400, 0.9, "lowpass");        // ボコッ（突沸）
+    vacuum = Math.max(0, vacuum - 25);  // あわててリークを開ける
+    bumpTimer = 60;
+  }
+  if (bumpTimer > 0) bumpTimer--;
+}
+
+function finishEvap() {
+  if (evapProgress >= 100) nextStep(evapLoss);   // 濃縮しきるまで次へ進めない
+}
+
+// ロータリーエバポレーターを描く
+function drawEvap() {
+  const boiling = boilP - currentPressure() > 0 && evapProgress < 100;
+  const fx = 320, fy = 300, fr = 48;    // ナスフラスコの中心と半径
+
+  // スタンドの支柱
+  ctx.fillStyle = "#95a5a6";
+  ctx.fillRect(590, 60, 8, 340);
+  ctx.fillRect(540, 140, 50, 6);        // 冷却管を留めるアーム
+  ctx.fillRect(455, 225, 135, 6);       // モーターを留めるアーム
+
+  // 湯浴の本体
+  ctx.fillStyle = "#2d3436";
+  ctx.fillRect(235, 305, 190, 95);
+  ctx.fillStyle = "#000";               // 温度表示
+  ctx.fillRect(250, 365, 70, 24);
+  ctx.fillStyle = "#ff4d4d";
+  ctx.font = "16px monospace";
+  ctx.fillText("40.0℃", 256, 383);
+
+  // ナスフラスコ（回転している）。運ばれてくる途中・運び出す途中は描かない
+  const showFlask = !isCarrying("evap", "in") && !isCarrying("evap", "out");
+  if (showFlask) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(fx, fy, fr, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fillRect(fx - fr, fy - fr, fr * 2, fr * 2);
+  const level = fy + fr - 75 * (1 - evapProgress / 100) - 6;   // 濃縮が進むほど液が減る
+  ctx.fillStyle = "#f0a830";
+  ctx.fillRect(fx - fr, level, fr * 2, fy + fr - level);
+  // 回転で内壁に広がる薄い液膜
+  ctx.strokeStyle = "rgba(240,168,48,0.5)";
+  ctx.lineWidth = 4;
+  for (let i = 0; i < 3; i++) {
+    const a = t * 0.08 + i * 2.1;
+    ctx.beginPath();
+    ctx.arc(fx, fy, fr - 5, a, a + 0.8);
+    ctx.stroke();
+  }
+  if (boiling) {                        // 沸騰の泡
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    for (let i = 0; i < 6; i++) {
+      ctx.beginPath();
+      ctx.arc(fx - 30 + Math.random() * 60, level + Math.random() * 25, 2 + Math.random() * 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+  ctx.strokeStyle = "#636e72";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(fx, fy, fr, 0, Math.PI * 2);
+  ctx.stroke();
+  // ガラスのつや
+  ctx.strokeStyle = "rgba(255,255,255,0.8)";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(fx, fy, fr - 10, Math.PI * 1.1, Math.PI * 1.4);
+  ctx.stroke();
+
+  // フラスコの首（斜め上のモーターへ）
+  ctx.save();
+  ctx.translate(fx + 30, fy - 38);
+  ctx.rotate(-0.65);
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(0, -9, 80, 18);
+  ctx.strokeStyle = "#636e72";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, -9, 80, 18);
+  ctx.restore();
+  }
+
+  // 湯浴の水（フラスコの下半分が沈んで見えるよう、上から半透明で重ねる）
+  ctx.fillStyle = "rgba(116,185,255,0.55)";
+  ctx.fillRect(245, 312, 170, 50);
+  ctx.strokeStyle = "rgba(255,255,255,0.7)";   // 水面のさざ波
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 245; x <= 415; x += 5) {
+    const y = 312 + Math.sin(x * 0.15 + t * 0.15) * 1.5;
+    if (x === 245) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // 湯気
+  ctx.strokeStyle = "rgba(255,255,255,0.6)";
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    const sx = 270 + i * 55;
+    const rise = (t * 0.6 + i * 20) % 40;
+    ctx.beginPath();
+    ctx.moveTo(sx, 305 - rise);
+    ctx.quadraticCurveTo(sx + 8, 295 - rise, sx, 285 - rise);
+    ctx.stroke();
+  }
+
+  // 回転モーター
+  ctx.fillStyle = "#34495e";
+  ctx.fillRect(385, 200, 70, 50);
+  ctx.fillStyle = "#ecf0f1";
+  ctx.font = "11px sans-serif";
+  ctx.fillText("ROTARY", 397, 218);
+  ctx.strokeStyle = "#ecf0f1";          // 回転を示すマーク
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(420, 235, 8, t * 0.15, t * 0.15 + 4.5);
+  ctx.stroke();
+
+  // 蒸気の通り道（モーター → 冷却管）
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(455, 232, 60, 12);
+  ctx.strokeStyle = "#636e72";
+  ctx.strokeRect(455, 232, 60, 12);
+
+  // 冷却管（中を冷却水のコイルが通る）
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(510, 70, 44, 180);
+  ctx.strokeStyle = "#636e72";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(510, 70, 44, 180);
+  ctx.strokeStyle = "#0984e3";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let yy = 80; yy < 235; yy += 10) {
+    ctx.moveTo(515, yy);
+    ctx.lineTo(549, yy + 5);
+  }
+  ctx.stroke();
+  // 冷却水のホース
+  ctx.strokeStyle = "#74b9ff";
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(554, 85);  ctx.quadraticCurveTo(620, 60, 660, 110);
+  ctx.moveTo(554, 225); ctx.quadraticCurveTo(630, 230, 660, 180);
+  ctx.stroke();
+
+  // 受けフラスコ（冷えて液に戻った溶媒がたまる）
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(524, 250, 16, 22);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(532, 305, 36, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.fillRect(490, 265, 90, 80);
+  ctx.fillStyle = "#dff9fb";
+  ctx.fillRect(490, 341 - 55 * evapProgress / 100, 90, 70);
+  ctx.restore();
+  ctx.strokeStyle = "#636e72";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(532, 305, 36, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.strokeRect(524, 250, 16, 22);
+  // 凝縮したしずくが落ちる
+  if (boiling) {
+    ctx.fillStyle = "#74b9ff";
+    for (let i = 0; i < 3; i++) {
+      const dy = (t * 1.5 + i * 15) % 45;
+      ctx.beginPath();
+      ctx.arc(532, 240 + dy, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // 真空コントローラー（デジタル表示）
+  ctx.fillStyle = "#2d3436";
+  ctx.fillRect(620, 300, 150, 90);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(632, 312, 126, 40);
+  ctx.fillStyle = "#2ecc71";
+  ctx.font = "26px monospace";
+  ctx.fillText(String(Math.round(currentPressure())).padStart(4, " "), 640, 343);
+  ctx.font = "14px monospace";
+  ctx.fillText("hPa", 718, 343);
+  ctx.fillStyle = "#ecf0f1";
+  ctx.font = "11px sans-serif";
+  ctx.fillText("VACUUM CONTROLLER", 638, 375);
+
+  // 突沸したら液がフラスコの首からモーターの方へ噴き上がる
+  if (bumpTimer > 0) {
+    ctx.fillStyle = "#f0a830";
+    for (let i = 0; i < 14; i++) {
+      ctx.beginPath();
+      ctx.arc(330 + Math.random() * 90, 200 + Math.random() * 70, 3 + Math.random() * 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ===== 自然ろ過の状態とルール =====
+// 乾燥剤（硫酸ナトリウム）を入れた有機層を、ひだ折りろ紙でろ過する
+let sourceLeft = 100;   // 三角フラスコに残っている液（0〜100）
+let funnelLevel = 0;    // ろうとの中の液の高さ（100でろ紙の縁）
+let filtrate = 0;       // ろ過し終えた液（0〜100）
+let rinses = 0;         // 洗い込みをした回数
+let filterSpill = 0;    // あふれさせて失った量（％）
+let overflowTimer = 0;
+let rinseTimer = 0;
+
+function updateFilter() {
+  const pouring = keys[" "] === true && sourceLeft > 0;
+  if (pouring) {
+    const a = Math.min(0.6, sourceLeft);
+    sourceLeft -= a;
+    funnelLevel += a * 1.4;            // 注ぐとろうとの液面が上がる
+    if (t % 10 === 0) playNoise(0.15, 1500, 0.15, "bandpass");   // トポトポ
+  }
+  // ろ紙を通って少しずつ落ちる（液面が高いほど速い）
+  const drain = Math.min(funnelLevel, 0.004 * funnelLevel + 0.05);
+  funnelLevel -= drain;
+  filtrate = Math.min(100, filtrate + drain / 1.4);
+  if (drain > 0.1 && t % 25 === 0) playTone(1200 + Math.random() * 300, 0.05, 0.05);   // ポタッ
+  // ろ紙の縁を越えると、ろ紙の外を伝って液が漏れる
+  if (funnelLevel > 100) {
+    filterSpill += 10;
+    funnelLevel = 85;
+    overflowTimer = 60;
+    playNoise(0.6, 500, 0.6, "lowpass");
+  }
+  if (overflowTimer > 0) overflowTimer--;
+  if (rinseTimer > 0) rinseTimer--;
+}
+
+// Wキー：フラスコとろ紙を少量の溶媒で洗い込む（ろ紙や乾燥剤に残った目的物を回収する）
+function rinseFilter(key) {
+  if ((key === "w" || key === "W") && sourceLeft <= 0 && rinses < 3) {
+    rinses++;
+    funnelLevel += 25;
+    rinseTimer = 40;
+    playNoise(0.3, 2000, 0.2, "bandpass");
+  }
+}
+
+function finishFilter() {
+  if (sourceLeft > 0 || funnelLevel > 1) return;   // 注ぎ切って、落ち切るまで次へ進めない
+  const remainOnPaper = 8 * Math.pow(0.5, rinses);   // 洗い込むほど、ろ紙に残るロスが減る
+  nextStep(Math.min(100, filterSpill + remainOnPaper));
+}
+
+function drawFilter() {
+  const pouring = keys[" "] === true && sourceLeft > 0;
+  // スタンドとリング
+  ctx.fillStyle = "#95a5a6";
+  ctx.fillRect(520, 90, 8, 310);
+  ctx.fillRect(420, 200, 100, 6);
+  // 三角フラスコ（注ぐときはろうと側へ傾ける。運ばれてくる途中は描かない）
+  if (!isCarrying("filter", "in")) {
+    drawErlenmeyer(330, 250, pouring ? 1.0 : 0, sourceLeft / 100 * 0.7, "#f0a830", true, 1);
+  }
+  // 注いでいる液の筋
+  if (pouring) {
+    ctx.strokeStyle = "#f0a830";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(398, 208);
+    ctx.quadraticCurveTo(440, 195, 455, 218);
+    ctx.stroke();
+  }
+  // ろうと（ガラス）とひだ折りろ紙
+  ctx.beginPath();
+  ctx.moveTo(420, 205);
+  ctx.lineTo(520, 205);
+  ctx.lineTo(475, 285);
+  ctx.lineTo(465, 285);
+  ctx.closePath();
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = "#fdfdfd";            // ろ紙
+  ctx.fillRect(420, 205, 100, 80);
+  ctx.strokeStyle = "#dcdde1";          // ひだ
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 8; i++) {
+    ctx.beginPath();
+    ctx.moveTo(425 + i * 12, 205);
+    ctx.lineTo(470, 285);
+    ctx.stroke();
+  }
+  const ly = 285 - 0.8 * Math.min(funnelLevel, 100);   // ろうとの液面
+  ctx.fillStyle = "rgba(240,168,48,0.85)";
+  ctx.fillRect(420, ly, 100, 285 - ly);
+  ctx.restore();
+  ctx.strokeStyle = "#636e72";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.6)";   // ろうとの足
+  ctx.fillRect(466, 285, 8, 45);
+  ctx.strokeRect(466, 285, 8, 45);
+  // しずく
+  if (funnelLevel > 1) {
+    ctx.fillStyle = "#f0a830";
+    const dy = (t * 2) % 20;
+    ctx.beginPath();
+    ctx.arc(470, 332 + dy, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 受けの丸底フラスコ（ろ液がたまる。エバポへ運ばれる途中は描かない）
+  if (!isCarrying("filter", "out")) {
+    ctx.fillStyle = "#7f8c8d";            // コルクリング
+    ctx.fillRect(445, 392, 50, 8);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(470, 365, 28, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillRect(440, 335, 60, 60);
+    ctx.fillStyle = "#f0a830";
+    ctx.fillRect(440, 393 - 50 * filtrate / 100, 60, 60);
+    ctx.restore();
+    ctx.strokeStyle = "#636e72";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(470, 365, 28, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.45)";   // 首（ろうとの足が中に入る）
+    ctx.fillRect(461, 312, 18, 26);
+    ctx.lineWidth = 2;
+    ctx.strokeRect(461, 312, 18, 26);
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";  // つや
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(470, 365, 20, Math.PI * 1.1, Math.PI * 1.4);
+    ctx.stroke();
+  }
+  // 文字
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = "#000";
+  ctx.fillText("ろ紙の縁を越えないように", 560, 195);
+  ctx.fillText("少しずつ注ごう", 560, 217);
+  ctx.fillText("注ぎ終えたらWで洗い込み", 560, 245);
+  ctx.fillText("（最大3回）", 560, 267);
+  ctx.fillText("洗い込み：" + rinses + " 回", 560, 300);
+  ctx.font = "22px sans-serif";
+  if (overflowTimer > 0) {
+    ctx.fillStyle = "#c0392b";
+    ctx.fillText("ろ紙からあふれた！ −10%", 330, 160);
+  }
+  if (rinseTimer > 0) {
+    ctx.fillStyle = "#0984e3";
+    ctx.fillText("洗い込み", 400, 170);
+  }
+  if (sourceLeft <= 0 && funnelLevel <= 1) {
+    ctx.fillStyle = "#27ae60";
+    ctx.fillText("ろ過完了！", 560, 340);
+    ctx.fillText("Enterで次へ", 560, 368);
+  }
+}
+
+// ===== カラムの状態とルール =====
+let polarity = 30;        // 展開溶媒中の酢酸エチルの割合（％）
+let columnRunning = false;
+let columnDone = false;
+let columnTime = 0;
+let prodY = 112, impY = 112;          // 目的物と不純物の帯の位置
+let prodOut = 0, impOut = 0;          // 出口から出た割合（0〜1）
+let prodGot = 0, impGot = 0;          // 試験管に集めた割合（0〜1）
+let columnLoss = 0;
+const outletY = 318;                  // カラムの出口（シリカゲルの下端）の位置
+let collectX = 330, wasteX = 400;     // 目的物用と廃液用のビーカーの位置
+
+// 極性からRf値を決める（不純物は目的物より極性が低く、よく動く）
+function rfProduct() { return 1 - Math.exp(-0.012 * polarity); }
+function rfImpurity() { return rfProduct() + 0.25 * Math.exp(-0.03 * polarity); }
+
+function onEnterColumn() {
+  if (!columnRunning && !columnDone) columnRunning = true;   // 流し始める
+  else if (columnDone) nextStep(columnLoss);
+}
+
+function updateColumn() {
+  if (!columnRunning && !columnDone) {          // 流す前は極性を選ぶ
+    if (keys["ArrowLeft"])  polarity = Math.max(5, polarity - 0.3);
+    if (keys["ArrowRight"]) polarity = Math.min(90, polarity + 0.3);
+    return;
+  }
+  if (columnDone) return;
+  columnTime++;
+  const half = 15 + 0.075 * columnTime;         // 帯は時間とともに広がる
+  const vp = 0.3 + 2.5 * rfProduct();
+  const vi = 0.3 + 2.5 * rfImpurity();
+  const collecting = keys["c"] === true || keys["C"] === true;
+  // 帯が出口にかかっている間、少しずつ流れ出る
+  if (Math.abs(prodY - outletY) < half && prodOut < 1) {
+    const a = Math.min(vp / (2 * half), 1 - prodOut);
+    prodOut += a;
+    if (collecting) prodGot += a;
+    if (collecting && t % 20 === 0) playTone(1100 + Math.random() * 300, 0.06, 0.08);   // ポタッ
+  }
+  if (Math.abs(impY - outletY) < half && impOut < 1) {
+    const a = Math.min(vi / (2 * half), 1 - impOut);
+    impOut += a;
+    if (collecting) impGot += a;
+  }
+  prodY += vp;
+  impY += vi;
+  // 帯が出口を完全に通りすぎたら、残りもすべて流れ出たことにする
+  if (prodY - half > outletY && prodOut < 1) {
+    if (collecting) prodGot += 1 - prodOut;
+    prodOut = 1;
+  }
+  if (impY - half > outletY && impOut < 1) {
+    if (collecting) impGot += 1 - impOut;
+    impOut = 1;
+  }
+  if (prodOut >= 0.999 && impOut >= 0.999) {    // 両方とも出きったら終わり
+    columnDone = true;
+    columnRunning = false;
+    const tailing = rfProduct() < 0.15 ? (0.15 - rfProduct()) * 200 : 0;  // 動かなさすぎると尾を引く
+    columnLoss = Math.min(100, (1 - prodGot) * 100 + impGot * 40 + tailing);
+  }
+}
+
+function drawColumn() {
+  const half = 15 + 0.075 * columnTime;
+  const collecting = columnRunning && (keys["c"] === true || keys["C"] === true);
+  const L = 382, W = 36;                // カラム管の左端と幅
+  // スタンドとクランプ
+  ctx.fillStyle = "#95a5a6";
+  ctx.fillRect(455, 25, 8, 375);
+  ctx.fillRect(L + W, 140, 37, 6);
+  ctx.fillRect(L + W, 280, 37, 6);
+  // 溶媒だめ（上の球）
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(400, 50, 22, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.fillRect(378, 28, 44, 44);
+  ctx.fillStyle = "rgba(178,224,255,0.75)";
+  ctx.fillRect(378, 50 + Math.sin(t * 0.05), 44, 30);
+  ctx.restore();
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(400, 50, 22, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(178,224,255,0.75)";
+  ctx.fillRect(394, 71, 12, 8);
+  ctx.strokeRect(394, 71, 12, 8);
+  // 管の中身（上から 溶媒 → 砂 → シリカゲル → 砂 → 綿）
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(L + 2, 78, W - 4, 252);
+  ctx.clip();
+  ctx.fillStyle = "rgba(178,224,255,0.75)";
+  ctx.fillRect(L, 78, W, 24);
+  ctx.fillStyle = "#e5c98b";
+  ctx.fillRect(L, 102, W, 6);
+  ctx.fillStyle = "#f7f1e1";
+  ctx.fillRect(L, 108, W, 210);
+  ctx.fillStyle = "rgba(170,160,130,0.45)";     // シリカゲルの粒
+  for (let i = 0; i < 160; i++) {
+    ctx.fillRect(L + 3 + (i * 37) % 30, 109 + (i * 53) % 208, 1.6, 1.6);
+  }
+  // 帯（ふちをぼかして描く）
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(L, 108, W, 210);
+  ctx.clip();
+  function band(y, rgb) {
+    const g = ctx.createLinearGradient(0, y - half, 0, y + half);
+    g.addColorStop(0, "rgba(" + rgb + ",0)");
+    g.addColorStop(0.3, "rgba(" + rgb + ",0.85)");
+    g.addColorStop(0.7, "rgba(" + rgb + ",0.85)");
+    g.addColorStop(1, "rgba(" + rgb + ",0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(L, y - half, W, half * 2);
+  }
+  if (impOut < 1) band(impY, "142,68,173");     // 不純物（紫）
+  if (prodOut < 1) band(prodY, "230,126,34");   // 目的物（橙）
+  ctx.restore();
+  ctx.fillStyle = "#e5c98b";
+  ctx.fillRect(L, 318, W, 6);
+  ctx.fillStyle = "#ffffff";                    // 綿
+  ctx.fillRect(L, 324, W, 6);
+  ctx.restore();
+  // 管の輪郭とつや
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2.5;
+  ctx.strokeRect(L, 78, W, 252);
+  ctx.strokeStyle = "rgba(255,255,255,0.8)";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(L + 6, 86);
+  ctx.lineTo(L + 6, 322);
+  ctx.stroke();
+  // 下のしぼり、コック、先端
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.beginPath();
+  ctx.moveTo(L, 330);
+  ctx.lineTo(L + W, 330);
+  ctx.lineTo(403, 342);
+  ctx.lineTo(397, 342);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = "#6c7a89";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.fillStyle = "#b2bec3";
+  ctx.fillRect(393, 342, 14, 9);
+  ctx.fillStyle = "#ffffff";                    // テフロンのコック（流している間は開く）
+  if (columnRunning) ctx.fillRect(398, 336, 4, 22);
+  else ctx.fillRect(387, 344, 26, 4);
+  ctx.strokeRect(393, 342, 14, 9);
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(398, 351, 4, 8);
+  ctx.strokeRect(398, 351, 4, 8);
+  // しずく
+  if (columnRunning) {
+    const near = Math.abs(prodY - outletY) < half ? "#e67e22" : (Math.abs(impY - outletY) < half ? "#8e44ad" : "#b2e0ff");
+    ctx.fillStyle = near;
+    ctx.beginPath();
+    ctx.arc(400, 360 + (t * 1.5) % 6, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 受けのビーカー：Cを押している間は目的物用が出口の下に来る
+  collectX += ((collecting ? 400 : 330) - collectX) * 0.25;
+  wasteX += ((collecting ? 470 : 400) - wasteX) * 0.25;
+  const wasteAmount = (prodOut - prodGot) + (impOut - impGot);
+  drawBeaker(wasteX, 398, "廃液", [{ amount: wasteAmount * 0.5, color: "rgba(160,120,170,0.7)" }]);
+  if (!isCarrying("column", "out")) {
+    drawBeaker(collectX, 398, "目的物", [
+      { amount: prodGot * 0.8, color: "rgba(230,126,34,0.85)" },
+      { amount: impGot * 0.8, color: "rgba(142,68,173,0.75)" }
+    ]);
+  }
+  // 極性とRf値の表示（TLCで予習する）
+  ctx.fillStyle = "#000";
+  ctx.font = "16px sans-serif";
+  ctx.fillText("ヘキサン：酢酸エチル = " + Math.round(100 - polarity) + "：" + Math.round(polarity), 520, 200);
+  ctx.fillText("目的物 Rf " + rfProduct().toFixed(2) + "　不純物 Rf " + rfImpurity().toFixed(2), 520, 225);
+  ctx.fillStyle = "#7bed9f";
+  ctx.fillRect(560, 240, 120, 140);
+  ctx.strokeRect(560, 240, 120, 140);
+  const base = 365, front = 255;
+  ctx.fillStyle = "#4b2a57";
+  ctx.beginPath();
+  ctx.ellipse(590, base - rfProduct() * (base - front), 8, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(650, base - Math.min(1, rfImpurity()) * (base - front), 8, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.font = "13px sans-serif";
+  ctx.fillText("目的物", 570, 395);
+  ctx.fillText("不純物", 630, 395);
+}
+
+// ===== 結果画面 =====
+const stepNames = { extract: "抽出", tlc: "分液", filter: "自然ろ過", evap: "エバポ", column: "カラム" };
+function drawResult() {
+  // 白い枠
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  ctx.fillRect(90, 70, 620, 350);
+  ctx.strokeStyle = "#555";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(90, 70, 620, 350);
+  // 真ん中の仕切り線
+  ctx.strokeStyle = "#ccc";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(400, 88); ctx.lineTo(400, 340);
+  ctx.stroke();
+
+  // ----- 今回の結果（左側） -----
+  // 左の列：項目名は x=120 から左そろえ、数字は x=370 で右そろえ
+  const L = 120, R = 370;
+  ctx.fillStyle = "#000";
+  ctx.textAlign = "left";
+  ctx.font = "24px sans-serif";
+  ctx.fillText("今回の結果", 110, 108);
+  ctx.font = "14px sans-serif";
+  ctx.fillStyle = "#555";
+  ctx.fillText("抽出溶媒：" + solvent, 112, 132);
+  ctx.fillStyle = "#000";
+  ctx.font = "18px sans-serif";
+  for (let i = 0; i < log.length; i++) {
+    const y = 165 + i * 26;
+    ctx.textAlign = "left";
+    ctx.fillText(stepNames[log[i].step], L, y);
+    ctx.textAlign = "right";
+    ctx.fillText("ロス " + log[i].loss.toFixed(1) + " %", R, y);
+  }
+  // 区切り線
+  ctx.strokeStyle = "#888";
+  ctx.beginPath();
+  ctx.moveTo(115, 286); ctx.lineTo(375, 286);
+  ctx.stroke();
+  const total = 100 - remain;
+  let rank = "後処理マスター！";
+  if (total > 20) rank = "まずまず";
+  if (total > 40) rank = "もう一回練習しよう";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("トータル", L, 316);
+  ctx.textAlign = "right";
+  ctx.fillText("ロス " + total.toFixed(1) + " %", R, 316);
+  ctx.textAlign = "left";
+  ctx.fillText("評価", L, 346);
+  ctx.textAlign = "right";
+  ctx.fillStyle = total > 40 ? "#c0392b" : total > 20 ? "#d35400" : "#27ae60";
+  ctx.fillText(rank, R, 346);
+
+  // ----- 過去の記録（右側） -----
+  // 右の列：日時は x=425、溶媒は x=520 から左そろえ、ロスは x=685 で右そろえ
+  ctx.fillStyle = "#000";
+  ctx.textAlign = "left";
+  ctx.font = "20px sans-serif";
+  ctx.fillText("過去の記録", 425, 108);
+  ctx.font = "14px sans-serif";
+  if (records.length === 0) {
+    ctx.fillStyle = "#777";
+    ctx.fillText("まだ記録がありません", 425, 165);
+  }
+  for (let i = 0; i < Math.min(5, records.length); i++) {
+    const r = records[i];
+    const y = 165 + i * 26;
+    ctx.fillStyle = i === 0 ? "#0984e3" : "#000";   // いちばん上（今回）は青
+    ctx.textAlign = "left";
+    ctx.fillText(r.date, 425, y);
+    ctx.fillText(r.solvent, 520, y);
+    ctx.textAlign = "right";
+    ctx.fillText(r.loss.toFixed(1) + " %", 685, y);
+  }
+  ctx.strokeStyle = "#888";
+  ctx.beginPath();
+  ctx.moveTo(420, 286); ctx.lineTo(690, 286);
+  ctx.stroke();
+  if (records.length > 0) {
+    let best = records[0].loss;
+    for (let i = 1; i < records.length; i++) best = Math.min(best, records[i].loss);
+    ctx.fillStyle = "#000";
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("ベスト", 425, 316);
+    ctx.textAlign = "right";
+    ctx.fillText("ロス " + best.toFixed(1) + " %", 685, 316);
+  }
+
+  // もう一度ボタン（真ん中下）
+  const b = restartButton;
+  ctx.fillStyle = "#0984e3";
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = "#fff";
+  ctx.font = "20px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("もう一度（R）", b.x + b.w / 2, b.y + 27);
+  ctx.textAlign = "left";   // ほかの文字に影響しないよう、元に戻す
+}
+
+// ===== 文字の表示 =====
+function drawText() {
+  ctx.font = "18px sans-serif";
+  // 待機画面と結果画面では、工程と残りを出さず、音のオン／オフだけを出す
+  if (steps[stepIndex] === "title" || steps[stepIndex] === "result") {
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillRect(10, 10, 150, 30);
+    ctx.fillStyle = "#000";
+    ctx.fillText(muted ? "音：オフ（M）" : "音：オン（M）", 20, 32);
+    return;
+  }
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillRect(10, 10, 260, 50);
+  ctx.fillStyle = "#000";
+  ctx.fillText("工程: " + steps[stepIndex], 20, 32);
+  ctx.fillText("残り: " + remain.toFixed(1) + " %", 20, 54);
+  ctx.fillText(muted ? "音：オフ（M）" : "音：オン（M）", 150, 32);
+}
+
+function draw() {
+  drawLab();
+  if (transition) {
+    // 前の場面が左へ流れ、次の場面が右から入ってくる（器具を持って移動している感じ）
+    const pan = ease(Math.min(1, transition.frame / 80)) * 800;
+    ctx.save();
+    ctx.translate(-pan, 0);
+    drawScene(transition.from);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(800 - pan, 0);
+    drawScene(transition.to);
+    ctx.restore();
+    drawCarry(transition.plan, Math.min(1, transition.frame / transitionLength));
+  } else {
+    drawScene(steps[stepIndex]);
+  }
+  drawText();
+}
+
+// 工程ごとの場面を描く
+function drawScene(step) {
+  if (step === "title") {
+    ctx.fillStyle = "#000";
+    ctx.font = "40px sans-serif";
+    ctx.fillText("後処理マスター", 260, 260);
+    ctx.font = "20px sans-serif";
+    ctx.fillText("Enterでスタート", 330, 300);
+    ctx.font = "16px sans-serif";
+    ctx.fillText("M：音のオン／オフ", 335, 330);
+  }
+  if (step === "extract") {
+    const shaking = keys[" "] === true;   // スペースキーを押している間は振る
+    const angle = shaking ? Math.sin(t * 0.4) * 0.5 : 0;
+    drawFunnel(400, 240, angle, shaking, pressure * 0.08);
+    ctx.fillStyle = "#000";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("目的物（橙色）が水層から", 560, 230);
+    ctx.fillText("有機層へ移ったら抽出完了", 560, 252);
+    ctx.fillText("栓が浮いてきたらガス抜き", 560, 290);
+    ctx.font = "24px sans-serif";
+    if (ventTimer > 0) {
+      ctx.fillStyle = "#2980b9";
+      ctx.fillText("プシュッ！", 420, 110);
+    }
+    if (spillTimer > 0) {
+      ctx.fillStyle = "#c0392b";
+      ctx.fillText("吹きこぼれ！ −20%", 420, 140);
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("スペース：振る　V：ガス抜き　Enter：抽出を終える", 190, 460);
+    ctx.fillStyle = "#000";
+    ctx.fillText("抽出溶媒：" + solvent, 560, 360);
+  }
+  if (step === "tlc") {
+    // スタンドとリング
+    ctx.fillStyle = "#95a5a6";
+    ctx.fillRect(280, 40, 8, 360);
+    ctx.fillRect(288, 205, 75, 5);
+    const open = keys[" "] === true && (lowerLeft > 0 || upperLeft > 0) && !transition;
+    drawFunnel(400, 190, 0, false, 0, lowerLeft, upperLeft, open);
+    // 出口から流れ落ちる液
+    if (open) {
+      const flowingOrganic = lowerLeft > 0 ? !organicIsUpper : organicIsUpper;
+      ctx.strokeStyle = flowingOrganic ? "#f0a830" : "#9fd3ef";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(400, 330);
+      ctx.lineTo(400, 360);
+      ctx.stroke();
+    }
+    // 受け器：回収用の三角フラスコと廃液ビーカー
+    const orgCol = "rgba(240,168,48,0.85)", aqCol = "rgba(159,211,239,0.85)";
+    if (!isCarrying("tlc", "out")) {
+      const total = collectOrg + collectAq;
+      const mixed = total > 0 ? mixColor("#9fd3ef", "#f0a830", collectOrg / total) : "#f0a830";
+      drawErlenmeyer(sepCollectX, 377, 0, Math.min(0.75, total * 0.45), mixed, false, 0.55);
+      ctx.fillStyle = "#2d3436";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("回収", sepCollectX - 12, 395);
+    }
+    drawBeaker(sepWasteX, 398, "廃液", [
+      { amount: (wasteAq + wasteOrg) * 0.6, color: wasteOrg > wasteAq ? orgCol : aqCol }
+    ]);
+    ctx.fillStyle = "#000";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("上層 →", 298, 175);
+    ctx.fillText("下層 →", 308, 230);
+    ctx.fillText("抽出溶媒：" + solvent, 20, 175);
+    const uv = keys["u"] === true || keys["U"] === true;
+    if (uv) {                           // UVランプ
+      ctx.fillStyle = "#6c5ce7";
+      ctx.fillRect(500, 70, 240, 16);
+    }
+    drawTLC(520, 100, uv);
+    ctx.font = "15px sans-serif";
+    ctx.fillText("TLCで目的物のある層を確かめ、", 530, 378);
+    ctx.fillText("その層だけを回収フラスコに取ろう", 530, 396);
+    if (lowerLeft <= 0 && upperLeft <= 0) {
+      ctx.font = "20px sans-serif";
+      ctx.fillStyle = "#27ae60";
+      ctx.fillText("分液完了！", 20, 215);
+      ctx.fillText("Enterで次へ", 20, 242);
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "17px sans-serif";
+    ctx.fillText("U：UVで確認　←：回収フラスコ　→：廃液　スペース：コックを開く　Enter：次へ", 60, 460);
+  }
+  if (step === "filter") {
+    drawFilter();
+    ctx.fillStyle = "#fff";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("スペース：注ぐ　W：洗い込み　Enter：次へ", 220, 460);
+  }
+  if (step === "evap") {
+    drawEvap();
+    drawMeter(20, 220, "減圧の強さ（↑↓）", vacuum, "#0984e3");
+    drawMeter(20, 280, "濃縮の進み具合", evapProgress, "#27ae60");
+    drawMeter(20, 340, "突沸の危険度", bumpRisk, bumpRisk > 60 ? "#e74c3c" : "#f39c12");
+    ctx.fillStyle = "#000";
+    ctx.font = "16px sans-serif";
+    ctx.fillText(solvent + "が沸く目安：" + boilP + " hPa", 20, 170);
+    ctx.font = "24px sans-serif";
+    if (bumpTimer > 0) {
+      ctx.fillStyle = "#c0392b";
+      ctx.fillText("突沸！ −15%", 620, 120);
+    }
+    if (evapProgress >= 100) {
+      ctx.fillStyle = "#27ae60";
+      ctx.fillText("濃縮完了！", 620, 150);
+      ctx.fillText("Enterで次へ", 620, 180);
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("↑：減圧を強める　↓：弱める　突沸させずに溶媒を飛ばそう", 150, 460);
+  }
+  if (step === "column") {
+    drawColumn();
+    ctx.font = "20px sans-serif";
+    if (columnDone) {
+      ctx.fillStyle = "#27ae60";
+      ctx.fillText("カラム終了！ Enterで結果へ", 520, 120);
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "18px sans-serif";
+    if (!columnRunning && !columnDone) {
+      ctx.fillText("←→：溶媒の極性を変える　Enter：流し始める", 180, 460);
+    } else {
+      ctx.fillText("C を押している間、目的物のビーカーに集める（橙が目的物）", 140, 460);
+    }
+  }
+  if (step === "result") {
+    drawResult();
+  }
+}
+
+function update() {
+  if (steps[stepIndex] !== "evap") setBoilVolume(0);
+  if (transition) {                     // 運んでいる間は時間だけ進める
+    transition.frame++;
+    if (transition.frame >= transitionLength) transition = null;
+    return;
+  }
+  if (steps[stepIndex] === "extract") updateExtract();
+  if (steps[stepIndex] === "tlc") updateSeparation();
+  if (steps[stepIndex] === "filter") updateFilter();
+  if (steps[stepIndex] === "evap") updateEvap();
+  if (steps[stepIndex] === "column") updateColumn();
+}
+
+function loop() {
+  t++;
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
